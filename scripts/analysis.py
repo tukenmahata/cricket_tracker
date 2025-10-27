@@ -1,103 +1,130 @@
-# scripts/analysis.py
+"""
+Cricket Tracker - Performance Analysis using MySQL, Pandas, and Matplotlib
+---------------------------------------------------------------------------"""
+
 import pandas as pd
 import matplotlib.pyplot as plt
 from sqlalchemy import create_engine
 import os
 
-DB_PATH = os.path.join('db', 'cricket.db')
-engine = create_engine(f"sqlite:///{DB_PATH}")
+# ---------------------------------------------------------------------
+# 1. Database connection setup
+# ---------------------------------------------------------------------
+DB_USER = "root"       # must match your MySQL setup
+DB_PASS = ""
+DB_HOST = "localhost"
+DB_NAME = "cricket"
+
+# Create SQLAlchemy engine
+engine = create_engine(
+    f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}"
+)
+
+# ---------------------------------------------------------------------
+# 2. Load tables from MySQL into pandas DataFrames
+# ---------------------------------------------------------------------
+print("📦 Loading data from MySQL...")
 
 players = pd.read_sql("SELECT * FROM players", engine)
 matches = pd.read_sql("SELECT * FROM matches", engine)
 perf = pd.read_sql("SELECT * FROM performances", engine)
 
-# Aggregations
-runs_per_player = perf.groupby('player_id', as_index=False)['runs'].sum()
-runs_per_player = runs_per_player.merge(players[['player_id','full_name']], on='player_id')
+print(f"✅ Loaded {len(players)} players, {len(matches)} matches, {len(perf)} performance records.")
 
-appearances = perf.groupby('player_id', as_index=False).size().reset_index(name='appearances')
-batting = runs_per_player.merge(appearances, on='player_id')
+# ---------------------------------------------------------------------
+# 3. Data analysis using pandas
+# ---------------------------------------------------------------------
+print("\n⚙️ Analyzing player performance...")
 
-balls = perf.groupby('player_id', as_index=False)['balls_faced'].sum()
-batting = batting.merge(balls, on='player_id')
-batting['avg_naive'] = batting['runs'] / batting['appearances']
-batting['strike_rate'] = batting.apply(lambda r: (r['runs']/r['balls_faced']*100) if r['balls_faced']>0 else 0, axis=1)
+# Total runs and wickets per player
+summary = perf.groupby('player_id', as_index=False).agg({
+    'runs': 'sum',
+    'balls_faced': 'sum',
+    'wickets': 'sum',
+    'not_out': 'sum'
+})
 
-print("=== Batting summary ===")
-print(batting[['player_id','full_name','runs','appearances','avg_naive','balls_faced','strike_rate']].to_string(index=False))
+# Add player name
+summary = summary.merge(players[['player_id', 'full_name', 'role']], on='player_id', how='left')
 
-# Player report function
+# Calculate batting average and strike rate
+summary['innings'] = perf.groupby('player_id')['perf_id'].count().values
+summary['dismissals'] = summary['innings'] - summary['not_out']
+summary['dismissals'] = summary['dismissals'].replace(0, pd.NA)
+summary['batting_average'] = summary['runs'] / summary['dismissals']
+summary['strike_rate'] = summary.apply(
+    lambda r: (r['runs'] / r['balls_faced'] * 100) if r['balls_faced'] > 0 else 0,
+    axis=1
+)
+
+# Sort players by total runs
+summary = summary.sort_values(by='runs', ascending=False)
+
+print("📊 Batting Summary:")
+print(summary[['player_id', 'full_name', 'role', 'runs', 'wickets', 'batting_average', 'strike_rate']].to_string(index=False))
+
+# ---------------------------------------------------------------------
+# 4. Visualization (Matplotlib)
+# ---------------------------------------------------------------------
+os.makedirs('plots', exist_ok=True)
+
+# Bar Chart - Total Runs per Player
+plt.figure(figsize=(8,5))
+plt.bar(summary['full_name'], summary['runs'], color='skyblue', edgecolor='black')
+plt.title("Total Runs by Player")
+plt.xlabel("Player")
+plt.ylabel("Total Runs")
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig('plots/total_runs_per_player.png')
+plt.close()
+
+# Histogram - Distribution of Runs per Innings
+plt.figure(figsize=(8,5))
+plt.hist(perf['runs'], bins=range(0, 101, 10), color='lightgreen', edgecolor='black')
+plt.title("Distribution of Runs per Innings")
+plt.xlabel("Runs Scored")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.savefig('plots/runs_distribution.png')
+plt.close()
+
+print("Charts created in the 'plots' folder:")
+print(" - total_runs_per_player.png")
+print(" - runs_distribution.png")
+
+# ---------------------------------------------------------------------
+# 5. Individual player performance report
+# ---------------------------------------------------------------------
 def player_report(player_id):
-    pinfo = players[players['player_id']==player_id].iloc[0].to_dict()
-    pperf = perf[perf['player_id']==player_id].merge(matches, on='match_id')
+    """Return detailed stats for a given player."""
+    pinfo = players[players['player_id'] == player_id].iloc[0]
+    pperf = perf[perf['player_id'] == player_id].merge(matches, on='match_id')
+
     total_runs = pperf['runs'].sum()
     total_wickets = pperf['wickets'].sum()
     total_balls = pperf['balls_faced'].sum()
-    appearances = len(pperf)
-    avg = total_runs / appearances if appearances>0 else None
-    sr = (total_runs/total_balls*100) if total_balls>0 else None
-    report = {
-        'player': pinfo['full_name'],
-        'role': pinfo['role'],
-        'total_runs': int(total_runs),
-        'total_wickets': int(total_wickets),
-        'appearances': appearances,
-        'batting_avg_naive': avg,
-        'strike_rate': sr,
-        'match_details': pperf[['match_id','date','opponent','runs','balls_faced','wickets']].to_dict('records')
-    }
-    return report
+    innings = len(pperf)
+    not_outs = pperf['not_out'].sum()
+    dismissals = innings - not_outs if innings > 0 else 0
 
-# Visualizations directory
-os.makedirs('plots', exist_ok=True)
+    avg = round(total_runs / dismissals, 2) if dismissals > 0 else total_runs
+    sr = round(total_runs / total_balls * 100, 2) if total_balls > 0 else 0
 
-def plot_runs_over_time(player_id):
-    pperf = perf[perf['player_id']==player_id].merge(matches, on='match_id').sort_values('date')
-    if pperf.empty:
-        print('No data for', player_id)
-        return
-    plt.figure()
-    plt.plot(pd.to_datetime(pperf['date']), pperf['runs'], marker='o')
-    plt.title(f"Runs over time: {player_id}")
-    plt.xlabel('Date')
-    plt.ylabel('Runs')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'plots/runs_over_time_{player_id}.png')
-    plt.close()
+    print(" Player Performance Report:")
+    print(f" Player Name : {pinfo['full_name']}")
+    print(f" Role        : {pinfo['role']}")
+    print(f" Total Runs  : {total_runs}")
+    print(f" Total Wkts  : {total_wickets}")
+    print(f" Innings     : {innings}")
+    print(f" Not Outs    : {not_outs}")
+    print(f" Average     : {avg}")
+    print(f" Strike Rate : {sr}\n")
 
-def plot_total_runs_bar():
-    df = runs_per_player.sort_values('runs', ascending=True)
-    plt.figure()
-    plt.barh(df['full_name'], df['runs'])
-    plt.title('Total runs per player')
-    plt.xlabel('Runs')
-    plt.tight_layout()
-    plt.savefig('plots/total_runs_per_player.png')
-    plt.close()
+    print(" Match-wise Breakdown:")
+    print(pperf[['match_id', 'date', 'opponent', 'runs', 'balls_faced', 'wickets']].to_string(index=False))
 
-def plot_runs_histogram():
-    plt.figure()
-    plt.hist(perf['runs'], bins=range(0, 101, 10))
-    plt.title('Distribution of runs per innings')
-    plt.xlabel('Runs')
-    plt.ylabel('Frequency')
-    plt.tight_layout()
-    plt.savefig('plots/runs_histogram.png')
-    plt.close()
+# Example report (you can test with any player_id like P001)
+player_report('P001')
 
-# Generate plots and example report
-plot_total_runs_bar()
-plot_runs_histogram()
-plot_runs_over_time('P001')
-
-print('\nPlots saved in ./plots/')
-
-# Example: filtering with pandas
-high_performers = batting[(batting['appearances']>1) & (batting['avg_naive']>40)]
-print('\nHigh performers (appearances>1 & avg>40):')
-print(high_performers[['player_id','full_name','appearances','avg_naive']].to_string(index=False))
-
-if __name__ == '__main__':
-    print('\nExample player report for P001:')
-    print(player_report('P001'))
+print("Analysis completed successfully!")
